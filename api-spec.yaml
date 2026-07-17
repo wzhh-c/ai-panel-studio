@@ -1,0 +1,768 @@
+openapi: "3.0.3"
+info:
+  title: 圆桌讨论系统 API
+  description: |
+    基于大模型生成专家阵容的多方实时讨论平台。
+    - REST 接口：CRUD 讨论 + 生命周期控制
+    - SSE 接口：实时推送发言、共识、分歧、总结事件
+  version: "1.0.0"
+  contact:
+    name: 圆桌讨论团队
+
+servers:
+  - url: http://localhost:8080/api
+    description: 本地开发环境
+
+tags:
+  - name: Discussion
+    description: 讨论生命周期管理
+  - name: Stream
+    description: 实时事件流（SSE）
+
+# ============================================================
+# 通用数据模型
+# ============================================================
+components:
+  schemas:
+
+    # ── 枚举 ──────────────────────────────────────────────
+
+    DiscussionStatus:
+      type: string
+      enum:
+        - GENERATING
+        - PENDING_CONFIRM
+        - IN_PROGRESS
+        - COMPLETED
+      description: |
+        GENERATING — 大模型正在生成阵容；
+        PENDING_CONFIRM — 阵容已生成，等待用户确认；
+        IN_PROGRESS — 讨论进行中；
+        COMPLETED — 讨论已结束。
+
+    ExpertRole:
+      type: string
+      enum:
+        - moderator
+        - expert
+
+    SpeechType:
+      type: string
+      enum:
+        - main
+        - supplement
+        - rebuttal
+        - question
+
+    # ── 核心实体 ──────────────────────────────────────────
+
+    Expert:
+      type: object
+      required: [id, name, role, profession, title, stance, color]
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: "550e8400-e29b-41d4-a716-446655440201"
+        name:
+          type: string
+          example: "林浩然"
+        role:
+          $ref: "#/components/schemas/ExpertRole"
+        profession:
+          type: string
+          example: "法学教授"
+        title:
+          type: string
+          example: "北京大学法学院教授、人工智能法律研究中心主任"
+        stance:
+          type: string
+          example: "支持赋予AI有限法律主体资格"
+        color:
+          type: string
+          pattern: "^#[0-9A-Fa-f]{6}$"
+          example: "#3B82F6"
+
+    Transcript:
+      type: object
+      required: [id, content, speaker_id, discussion_id, speech_type, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        content:
+          type: string
+          minLength: 1
+          example: "我认为应当赋予AI有限的法律主体资格……"
+        speaker_id:
+          type: string
+          format: uuid
+        speaker_name:
+          type: string
+          description: 冗余字段，减少前端 JOIN 请求
+          example: "林浩然"
+        speaker_color:
+          type: string
+          example: "#3B82F6"
+        discussion_id:
+          type: string
+          format: uuid
+        speech_type:
+          $ref: "#/components/schemas/SpeechType"
+        reply_to_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: speech_type 为 supplement/rebuttal 时必填
+        created_at:
+          type: string
+          format: date-time
+
+    Consensus:
+      type: object
+      required: [id, content, discussion_id, source_transcript_ids, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        content:
+          type: string
+          minLength: 1
+          example: "各方一致认为现有法律框架存在责任归属灰色地带"
+        discussion_id:
+          type: string
+          format: uuid
+        source_transcript_ids:
+          type: array
+          minItems: 2
+          items:
+            type: string
+            format: uuid
+        updated_at:
+          type: string
+          format: date-time
+
+    Divergence:
+      type: object
+      required: [id, content, discussion_id, sides, source_transcript_ids, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        content:
+          type: string
+          minLength: 1
+          example: "核心分歧：AI法律人格 vs. 纯人类责任框架"
+        discussion_id:
+          type: string
+          format: uuid
+        sides:
+          type: array
+          minItems: 2
+          items:
+            type: object
+            required: [expert_id, stance_label, summary]
+            properties:
+              expert_id:
+                type: string
+                format: uuid
+              expert_name:
+                type: string
+              expert_color:
+                type: string
+              stance_label:
+                type: string
+                example: "支持AI拟制人格"
+              summary:
+                type: string
+                example: "借鉴公司法人制度，创设新型法律主体"
+        source_transcript_ids:
+          type: array
+          minItems: 2
+          items:
+            type: string
+            format: uuid
+        updated_at:
+          type: string
+          format: date-time
+
+    # ── 列表摘要（轻量） ──────────────────────────────────
+
+    DiscussionSummary:
+      type: object
+      required: [id, topic, status, expert_count, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        topic:
+          type: string
+        status:
+          $ref: "#/components/schemas/DiscussionStatus"
+        expert_count:
+          type: integer
+        summary:
+          type: string
+          nullable: true
+          description: 主持人总结（仅 COMPLETED 状态有值）
+        created_at:
+          type: string
+          format: date-time
+
+    # ── 详情（完整） ──────────────────────────────────────
+
+    DiscussionDetail:
+      allOf:
+        - $ref: "#/components/schemas/DiscussionSummary"
+        - type: object
+          required: [created_by, started_at, ended_at, experts, transcripts, consensus_list, divergence_list]
+          properties:
+            created_by:
+              type: string
+              format: uuid
+            started_at:
+              type: string
+              format: date-time
+              nullable: true
+            ended_at:
+              type: string
+              format: date-time
+              nullable: true
+            experts:
+              type: array
+              items:
+                $ref: "#/components/schemas/Expert"
+            transcripts:
+              type: array
+              items:
+                $ref: "#/components/schemas/Transcript"
+            consensus_list:
+              type: array
+              items:
+                $ref: "#/components/schemas/Consensus"
+            divergence_list:
+              type: array
+              items:
+                $ref: "#/components/schemas/Divergence"
+
+    # ── 请求体 ────────────────────────────────────────────
+
+    CreateDiscussionRequest:
+      type: object
+      required: [topic]
+      properties:
+        topic:
+          type: string
+          minLength: 1
+          maxLength: 500
+          example: "人工智能是否应该拥有法律主体资格？"
+        expert_count:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 4
+          description: 专家人数 N（不含主持人）
+        user_id:
+          type: string
+          format: uuid
+          description: 发起人的用户 ID
+          example: "550e8400-e29b-41d4-a716-446655440001"
+
+    CreateDiscussionResponse:
+      type: object
+      required: [discussion_id, topic, expert_count, status, roster]
+      properties:
+        discussion_id:
+          type: string
+          format: uuid
+        topic:
+          type: string
+        expert_count:
+          type: integer
+        status:
+          type: string
+          enum: [PENDING_CONFIRM]
+        roster:
+          type: array
+          description: 大模型生成的完整阵容（含主持人，排在首位）
+          items:
+            $ref: "#/components/schemas/Expert"
+
+    EndDiscussionResponse:
+      type: object
+      required: [discussion_id, status, summary, ended_at]
+      properties:
+        discussion_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [COMPLETED]
+        summary:
+          type: string
+          description: 主持人自然语言总结
+        ended_at:
+          type: string
+          format: date-time
+
+    # ── 错误 ──────────────────────────────────────────────
+
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          example: "DISCUSSION_NOT_FOUND"
+        message:
+          type: string
+          example: "讨论不存在或已被删除"
+        details:
+          type: object
+          additionalProperties: true
+
+  # ============================================================
+  # SSE 事件定义（以 x-sse- 扩展描述）
+  # ============================================================
+
+  x-sse-stream:
+    path: /api/discussions/{discussion_id}/stream
+    description: |
+      讨论实时事件流（Server-Sent Events）。
+      客户端连接后持续接收 JSON 事件，直至讨论结束或主动断开。
+    events:
+
+      speech:
+        description: 专家或主持人发出新发言
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/SSEEnvelope"
+            - type: object
+              required: [data]
+              properties:
+                data:
+                  allOf:
+                    - $ref: "#/components/schemas/Transcript"
+                    - type: object
+                      properties:
+                        speaker_name: { type: string }
+                        speaker_color: { type: string }
+
+      status_update:
+        description: 讨论状态变更（GENERATING → PENDING_CONFIRM → IN_PROGRESS → COMPLETED）或专家发言状态更新
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/SSEEnvelope"
+            - type: object
+              required: [data]
+              properties:
+                data:
+                  type: object
+                  required: [discussion_id, status]
+                  properties:
+                    discussion_id: { type: string, format: uuid }
+                    previous_status: { $ref: "#/components/schemas/DiscussionStatus" }
+                    status: { $ref: "#/components/schemas/DiscussionStatus" }
+                    expert_id:
+                      type: string
+                      format: uuid
+                      description: 可选，当专家开始/结束 typing 时填充
+                    expert_status:
+                      type: string
+                      enum: [typing, idle, speaking]
+                      description: 专家当前状态
+
+      consensus_update:
+        description: 新共识产生或既有共识内容更新
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/SSEEnvelope"
+            - type: object
+              required: [data]
+              properties:
+                data:
+                  allOf:
+                    - $ref: "#/components/schemas/Consensus"
+                    - type: object
+                      properties:
+                        action:
+                          type: string
+                          enum: [created, updated]
+                          description: created=新共识；updated=既有共识被刷新
+
+      divergence_update:
+        description: 新分歧产生或既有分歧内容更新
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/SSEEnvelope"
+            - type: object
+              required: [data]
+              properties:
+                data:
+                  allOf:
+                    - $ref: "#/components/schemas/Divergence"
+                    - type: object
+                      properties:
+                        action:
+                          type: string
+                          enum: [created, updated]
+
+      summary:
+        description: 讨论结束，主持人输出自然语言总结（SSE 流的最后一个事件，发送后服务端关闭连接）
+        payload:
+          allOf:
+            - $ref: "#/components/schemas/SSEEnvelope"
+            - type: object
+              required: [data]
+              properties:
+                data:
+                  type: object
+                  required: [discussion_id, summary, ended_at]
+                  properties:
+                    discussion_id: { type: string, format: uuid }
+                    summary: { type: string }
+                    ended_at: { type: string, format: date-time }
+
+    SSEEnvelope:
+      type: object
+      required: [event, discussion_id, timestamp]
+      properties:
+        event:
+          type: string
+          enum: [speech, status_update, consensus_update, divergence_update, summary]
+          description: 事件类型，对应 SSE `event:` 字段
+        discussion_id:
+          type: string
+          format: uuid
+          description: 讨论 ID，方便前端多 Tab 场景过滤
+        timestamp:
+          type: string
+          format: date-time
+          description: 服务端事件生成时间（ISO 8601）
+        data:
+          type: object
+          additionalProperties: true
+          description: 事件载荷，结构与 `event` 类型对应
+
+# ============================================================
+# REST API 端点
+# ============================================================
+paths:
+
+  # ── 创建讨论 ────────────────────────────────────────────
+  /discussions:
+    post:
+      tags: [Discussion]
+      operationId: createDiscussion
+      summary: 创建讨论并触发大模型生成阵容
+      description: |
+        1. 创建 Discussion（status = GENERATING）
+        2. 调用大模型生成 1 位主持人 + N 位专家
+        3. 持久化 Expert 记录，status → PENDING_CONFIRM
+        4. 返回 discussion_id + 完整阵容
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDiscussionRequest"
+            example:
+              topic: "人工智能是否应该拥有法律主体资格？"
+              expert_count: 3
+              user_id: "550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        "201":
+          description: 阵容生成成功，等待用户确认
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateDiscussionResponse"
+              example:
+                discussion_id: "550e8400-e29b-41d4-a716-446655440100"
+                topic: "人工智能是否应该拥有法律主体资格？"
+                expert_count: 3
+                status: "PENDING_CONFIRM"
+                roster:
+                  - id: "550e8400-e29b-41d4-a716-446655440201"
+                    name: "陈若溪"
+                    role: "moderator"
+                    profession: "科技媒体主编"
+                    title: "《前沿对话》栏目首席主持人"
+                    stance: "中立引导者"
+                    color: "#6B7280"
+                  - id: "550e8400-e29b-41d4-a716-446655440202"
+                    name: "林浩然"
+                    role: "expert"
+                    profession: "法学教授"
+                    title: "北京大学法学院教授"
+                    stance: "支持赋予AI有限法律主体资格"
+                    color: "#3B82F6"
+                  - id: "550e8400-e29b-41d4-a716-446655440203"
+                    name: "苏婉清"
+                    role: "expert"
+                    profession: "技术伦理学家"
+                    title: "牛津大学人类未来研究所高级研究员"
+                    stance: "强烈反对赋予AI任何法律地位"
+                    color: "#EF4444"
+                  - id: "550e8400-e29b-41d4-a716-446655440204"
+                    name: "赵承宇"
+                    role: "expert"
+                    profession: "AI企业家"
+                    title: "深脑科技创始人兼CEO"
+                    stance: "实用主义：行业自律优于立法"
+                    color: "#10B981"
+        "400":
+          description: 参数校验失败
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: 大模型生成失败
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    # ── 获取讨论列表 ──────────────────────────────────────
+    get:
+      tags: [Discussion]
+      operationId: listDiscussions
+      summary: 获取所有讨论列表
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/DiscussionStatus"
+          description: 按状态筛选
+        - name: user_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: 按发起用户筛选
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        "200":
+          description: 讨论列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, total]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/DiscussionSummary"
+                  total:
+                    type: integer
+              example:
+                items:
+                  - id: "550e8400-e29b-41d4-a716-446655440100"
+                    topic: "人工智能是否应该拥有法律主体资格？"
+                    status: "IN_PROGRESS"
+                    expert_count: 3
+                    summary: null
+                    created_at: "2026-07-16T08:00:00Z"
+                  - id: "550e8400-e29b-41d4-a716-446655440101"
+                    topic: "太空殖民的伦理边界"
+                    status: "COMPLETED"
+                    expert_count: 5
+                    summary: "本次讨论达成核心共识：太空殖民必须以不损害天体原生环境为前提……"
+                    created_at: "2026-07-15T14:30:00Z"
+                total: 2
+
+  # ── 单个讨论操作 ────────────────────────────────────────
+  /discussions/{discussion_id}:
+    get:
+      tags: [Discussion]
+      operationId: getDiscussion
+      summary: 获取单个讨论详情（含完整 Transcript 与当前共识/分歧）
+      parameters:
+        - name: discussion_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: 讨论详情
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiscussionDetail"
+        "404":
+          description: 讨论不存在
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── 确认阵容并开始讨论 ──────────────────────────────────
+  /discussions/{discussion_id}/start:
+    post:
+      tags: [Discussion]
+      operationId: startDiscussion
+      summary: 用户确认阵容，推进到 IN_PROGRESS 并广播 status_update 事件
+      description: |
+        1. 校验 discussion 状态为 PENDING_CONFIRM
+        2. status → IN_PROGRESS，设置 started_at
+        3. 通过 SSE 广播 status_update 事件
+        4. 触发专家自主发言循环
+      parameters:
+        - name: discussion_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                confirmed_roster:
+                  type: array
+                  description: 用户可微调后的阵容（可选；不传则按生成阵容直接开始）
+                  items:
+                    $ref: "#/components/schemas/Expert"
+      responses:
+        "200":
+          description: 讨论已开始
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [discussion_id, status, started_at]
+                properties:
+                  discussion_id: { type: string, format: uuid }
+                  status: { type: string, enum: [IN_PROGRESS] }
+                  started_at: { type: string, format: date-time }
+        "400":
+          description: 当前状态不允许开始（如已是 IN_PROGRESS）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── 结束讨论 ────────────────────────────────────────────
+  /discussions/{discussion_id}/end:
+    post:
+      tags: [Discussion]
+      operationId: endDiscussion
+      summary: 结束讨论，触发主持人总结并关闭 SSE 流
+      description: |
+        1. 校验 discussion 状态为 IN_PROGRESS
+        2. 通知所有专家停止发言
+        3. 调用大模型用主持人口吻生成自然语言总结
+        4. status → COMPLETED，设置 ended_at 和 summary
+        5. 通过 SSE 广播 summary 事件，随后关闭流
+      parameters:
+        - name: discussion_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: 讨论已结束
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EndDiscussionResponse"
+              example:
+                discussion_id: "550e8400-e29b-41d4-a716-446655440100"
+                status: "COMPLETED"
+                summary: "经过近一小时的深入讨论，三位专家在AI法律人格问题上呈现了清晰的多元视角。林浩然教授主张借鉴公司法人制度创设AI拟制人格……苏婉清研究员则坚持人类不可推卸的最终责任……赵承宇从产业实践出发，提出风险分级可能比法律人格更加务实。我们的核心共识是：现有法律框架确实存在灰色地带，需要立法回应；而核心分歧在于回应的路径——是创设新主体还是完善现有追责链条。感谢各位的精彩发言。"
+                ended_at: "2026-07-16T09:00:00Z"
+        "400":
+          description: 当前状态不允许结束（如未开始或已结束）
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  # ── SSE 事件流 ──────────────────────────────────────────
+  /discussions/{discussion_id}/stream:
+    get:
+      tags: [Stream]
+      operationId: streamDiscussion
+      summary: 订阅讨论实时事件流（SSE）
+      description: |
+        建立长连接，接收讨论中产生的实时事件。
+        客户端应监听以下 SSE event 类型：
+        - `speech` — 新发言
+        - `status_update` — 状态变更
+        - `consensus_update` — 共识更新
+        - `divergence_update` — 分歧更新
+        - `summary` — 讨论结束总结（最后一条事件，此后服务端关闭连接）
+
+        每个事件 data 字段为 JSON，结构详见 `components.x-sse-stream`。
+      parameters:
+        - name: discussion_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: SSE 事件流
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                speech:
+                  summary: 新发言事件
+                  value: |
+                    event: speech
+                    data: {"event":"speech","discussion_id":"550e8400-e29b-41d4-a716-446655440100","timestamp":"2026-07-16T08:10:45Z","data":{"id":"...440302","content":"我认为应当赋予AI有限的法律主体资格……","speaker_id":"...440202","speaker_name":"林浩然","speaker_color":"#3B82F6","discussion_id":"...440100","speech_type":"main","created_at":"2026-07-16T08:10:45Z"}}
+
+                status_update:
+                  summary: 状态变更事件
+                  value: |
+                    event: status_update
+                    data: {"event":"status_update","discussion_id":"550e8400-e29b-41d4-a716-446655440100","timestamp":"2026-07-16T08:10:01Z","data":{"discussion_id":"...440100","previous_status":"PENDING_CONFIRM","status":"IN_PROGRESS"}}
+
+                consensus_update:
+                  summary: 共识更新事件
+                  value: |
+                    event: consensus_update
+                    data: {"event":"consensus_update","discussion_id":"550e8400-e29b-41d4-a716-446655440100","timestamp":"2026-07-16T08:16:00Z","data":{"id":"...440401","content":"各方一致认为现有法律框架存在责任归属灰色地带","discussion_id":"...440100","source_transcript_ids":["...440302","...440304"],"action":"created","updated_at":"2026-07-16T08:16:00Z"}}
+
+                divergence_update:
+                  summary: 分歧更新事件
+                  value: |
+                    event: divergence_update
+                    data: {"event":"divergence_update","discussion_id":"550e8400-e29b-41d4-a716-446655440100","timestamp":"2026-07-16T08:16:30Z","data":{"id":"...440501","content":"核心分歧：AI法律人格 vs. 纯人类责任框架","discussion_id":"...440100","sides":[{...}],"source_transcript_ids":["...440302","...440303","...440304"],"action":"created","updated_at":"2026-07-16T08:16:30Z"}}
+
+                summary:
+                  summary: 结束总结事件（SSE 最后一条）
+                  value: |
+                    event: summary
+                    data: {"event":"summary","discussion_id":"550e8400-e29b-41d4-a716-446655440100","timestamp":"2026-07-16T09:00:00Z","data":{"discussion_id":"...440100","summary":"经过近一小时的深入讨论……","ended_at":"2026-07-16T09:00:00Z"}}
+
+        "404":
+          description: 讨论不存在

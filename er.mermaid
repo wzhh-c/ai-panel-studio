@@ -1,0 +1,73 @@
+erDiagram
+    USER ||--o{ DISCUSSION : "发起 (created_by)"
+    DISCUSSION ||--o{ EXPERT : "包含 1位主持人 + N位专家"
+    EXPERT ||--o{ TRANSCRIPT : "发言 (speaker_id)"
+    DISCUSSION ||--o{ TRANSCRIPT : "拥有"
+    TRANSCRIPT ||--o| TRANSCRIPT : "回复 (reply_to_id)"
+    DISCUSSION ||--o{ CONSENSUS : "产生共识"
+    DISCUSSION ||--o{ DIVERGENCE : "产生分歧"
+    TRANSCRIPT }o--o{ CONSENSUS : "关联 ≥2条发言 (source_transcript_ids)"
+    TRANSCRIPT }o--o{ DIVERGENCE : "关联 ≥2条发言 (source_transcript_ids)"
+
+    USER {
+        string id PK
+        string name
+        string created_at
+        string updated_at
+    }
+
+    DISCUSSION {
+        string id PK
+        string topic
+        int expert_count
+        enum status "GENERATING|PENDING_CONFIRM|IN_PROGRESS|COMPLETED"
+        string summary "nullable"
+        string started_at "nullable"
+        string ended_at "nullable"
+        string created_by FK
+        string created_at
+        string updated_at
+    }
+
+    EXPERT {
+        string id PK
+        string name
+        enum role "moderator|expert"
+        string profession
+        string title
+        string stance
+        string color "hex"
+        string discussion_id FK
+        string created_at
+        string updated_at
+    }
+
+    TRANSCRIPT {
+        string id PK
+        text content
+        string speaker_id FK
+        string discussion_id FK
+        enum speech_type "main|supplement|rebuttal|question"
+        string reply_to_id FK "nullable"
+        string created_at
+        string updated_at
+    }
+
+    CONSENSUS {
+        string id PK
+        text content
+        string discussion_id FK
+        json source_transcript_ids "array, len>=2"
+        string created_at
+        string updated_at
+    }
+
+    DIVERGENCE {
+        string id PK
+        text content
+        string discussion_id FK
+        json sides "array, len>=2"
+        json source_transcript_ids "array, len>=2"
+        string created_at
+        string updated_at
+    }
